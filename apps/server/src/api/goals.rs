@@ -187,8 +187,7 @@ async fn build_valuation_map(state: &AppState) -> ApiResult<HashMap<String, f64>
     let account_ids: Vec<String> = accounts.into_iter().map(|a| a.id).collect();
     let base_currency = state.base_currency.read().unwrap().clone();
     let timezone = state.timezone.read().unwrap().clone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let service = CurrentAccountValuationService::new(
         state.account_service.as_ref(),
         state.snapshot_repository.as_ref(),

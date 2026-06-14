@@ -78,13 +78,9 @@ vi.mock("./accounts-summary", () => ({
 }));
 
 vi.mock("./balance", () => ({
-  default: ({
-    targetValue,
-    isUnavailable,
-  }: {
-    targetValue: number;
-    isUnavailable?: boolean;
-  }) => <div>{isUnavailable ? "balance:N/A" : `balance:${targetValue}`}</div>,
+  default: ({ targetValue, isUnavailable }: { targetValue: number; isUnavailable?: boolean }) => (
+    <div>{isUnavailable ? "balance:N/A" : `balance:${targetValue}`}</div>
+  ),
 }));
 
 vi.mock("./goals", () => ({

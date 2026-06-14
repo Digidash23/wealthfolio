@@ -551,8 +551,7 @@ async fn refresh_all_goal_summaries(context: &Arc<ServiceContext>) {
     let account_ids: Vec<String> = accounts.into_iter().map(|a| a.id).collect();
     let base_currency = context.get_base_currency();
     let timezone = context.get_timezone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let account_service = context.account_service();
     let snapshot_repository = context.snapshot_repository();
     let asset_service = context.asset_service();

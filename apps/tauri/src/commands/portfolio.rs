@@ -557,8 +557,7 @@ pub async fn get_current_valuation(
 
     let base_currency = state.get_base_currency();
     let timezone = state.get_timezone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let account_filter = filter.into_account_filter()?;
     let resolved = resolve_current_valuation_scope(&account_filter, &state).await?;
     let account_service = state.account_service();

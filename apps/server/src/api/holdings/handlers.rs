@@ -323,8 +323,7 @@ pub async fn get_current_valuation(
 ) -> ApiResult<Json<CurrentValuationResponse>> {
     let base_currency = state.base_currency.read().unwrap().clone();
     let timezone = state.timezone.read().unwrap().clone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let resolved = resolve_current_valuation_scope(&body.filter, &state)?;
     let service = CurrentAccountValuationService::new(
         state.account_service.as_ref(),

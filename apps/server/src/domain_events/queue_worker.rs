@@ -522,8 +522,7 @@ async fn refresh_all_goal_summaries(deps: Arc<QueueWorkerDeps>) {
     let account_ids: Vec<String> = accounts.into_iter().map(|account| account.id).collect();
     let base_currency = deps.base_currency.read().unwrap().clone();
     let timezone = deps.timezone.read().unwrap().clone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let service = CurrentAccountValuationService::new(
         deps.account_service.as_ref(),
         deps.snapshot_repository.as_ref(),

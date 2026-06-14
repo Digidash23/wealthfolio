@@ -56,8 +56,7 @@ async fn build_valuation_map(
     let account_ids: Vec<String> = accounts.into_iter().map(|a| a.id).collect();
     let base_currency = state.get_base_currency();
     let timezone = state.get_timezone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let latest_snapshot_cutoff = today.succ_opt().unwrap_or(today);
+    let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let account_service = state.account_service();
     let snapshot_repository = state.snapshot_repository();
     let asset_service = state.asset_service();
