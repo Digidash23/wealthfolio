@@ -1,48 +1,32 @@
 //! Commands for syncing broker data from the cloud API.
 
 use log::{debug, error, info};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::context::ServiceContext;
 use crate::events::{BROKER_SYNC_COMPLETE, BROKER_SYNC_ERROR, BROKER_SYNC_START};
 use wealthfolio_connect::{
-    broker::BrokerApiClient, fetch_subscription_plans_public, BrokerAccount, BrokerConnection,
-    PlansResponse, Platform, SyncConfig, SyncOrchestrator, SyncProgressPayload,
-    SyncProgressReporter, SyncResult, UserInfo,
+    acquire_broker_sync_guard, broker::BrokerApiClient, fetch_subscription_plans_public,
+    BrokerAccount, BrokerConnection, BrokerSyncRunGuard, PlansResponse, Platform, SyncConfig,
+    SyncOrchestrator, SyncProgressPayload, SyncProgressReporter, SyncResult, UserInfo,
 };
-
-pub(crate) struct BrokerSyncRunGuard {
-    running: Arc<AtomicBool>,
-}
-
-impl Drop for BrokerSyncRunGuard {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-    }
-}
 
 pub(crate) fn try_acquire_broker_sync_guard(
     context: &ServiceContext,
 ) -> Option<BrokerSyncRunGuard> {
-    context
-        .broker_sync_running()
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .ok()
-        .map(|_| BrokerSyncRunGuard {
-            running: context.broker_sync_running(),
-        })
+    acquire_broker_sync_guard(&context.broker_sync_running())
 }
 
-pub(crate) fn is_active_broker_connection(connection: &BrokerConnection) -> bool {
-    !connection.disabled
-        && connection
-            .status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
+pub(crate) fn emit_broker_sync_error(app_handle: &AppHandle, error_message: &str) {
+    app_handle
+        .emit(
+            BROKER_SYNC_ERROR,
+            serde_json::json!({ "error": error_message }),
+        )
+        .unwrap_or_else(|e| {
+            error!("Failed to emit broker:sync-error event: {}", e);
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,14 +67,7 @@ impl SyncProgressReporter for TauriProgressReporter {
                     error!("Failed to emit broker:sync-complete event: {}", e);
                 });
         } else {
-            self.app_handle
-                .emit(
-                    BROKER_SYNC_ERROR,
-                    serde_json::json!({ "error": result.message }),
-                )
-                .unwrap_or_else(|e| {
-                    error!("Failed to emit broker:sync-error event: {}", e);
-                });
+            emit_broker_sync_error(&self.app_handle, &result.message);
         }
     }
 }
@@ -183,7 +160,15 @@ pub(crate) async fn perform_broker_sync_with_guard(
 ) -> Result<SyncResult, String> {
     info!("Starting broker data sync...");
 
-    let client = context.connect_service().get_api_client().await?;
+    let client = match context.connect_service().get_api_client().await {
+        Ok(client) => client,
+        Err(err) => {
+            if let Some(app_handle) = app {
+                emit_broker_sync_error(app_handle, &err);
+            }
+            return Err(err);
+        }
+    };
 
     // Create progress reporter and orchestrator
     // Use TauriProgressReporter if we have an AppHandle, otherwise use NoOp

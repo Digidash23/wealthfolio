@@ -1,6 +1,6 @@
 #[cfg(feature = "connect-sync")]
 use crate::commands::brokers_sync::{
-    is_active_broker_connection, perform_broker_sync_with_guard, try_acquire_broker_sync_guard,
+    perform_broker_sync_with_guard, try_acquire_broker_sync_guard,
 };
 #[cfg(feature = "device-sync")]
 use crate::commands::device_sync::{
@@ -15,7 +15,12 @@ use std::future::Future;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 #[cfg(feature = "connect-sync")]
-use wealthfolio_connect::broker::{BrokerApiClient, BrokerConnection};
+use wealthfolio_connect::{
+    prepare_post_login_broker_bootstrap, BrokerApiClient, PostLoginBrokerBootstrapDecision,
+};
+use wealthfolio_connect::{
+    PostLoginBootstrapReason, PostLoginBootstrapResult, PostLoginBootstrapSyncResult,
+};
 use wealthfolio_core::secrets::SecretStore;
 #[cfg(feature = "device-sync")]
 use wealthfolio_device_sync::SyncState;
@@ -23,118 +28,6 @@ use wealthfolio_device_sync::SyncState;
 // Storage keys (without prefix - the SecretStore adds "wealthfolio_" prefix)
 const SYNC_ACCESS_TOKEN_KEY: &str = "sync_access_token";
 const SYNC_REFRESH_TOKEN_KEY: &str = "sync_refresh_token";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PostLoginBootstrapStatus {
-    Started,
-    Skipped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
-pub enum PostLoginBootstrapReason {
-    FeatureDisabled,
-    NotEntitled,
-    NoConnections,
-    AlreadyRunning,
-    NotEnrolled,
-    NotReady,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PostLoginBootstrapSyncResult {
-    status: PostLoginBootstrapStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<PostLoginBootstrapReason>,
-}
-
-impl PostLoginBootstrapSyncResult {
-    fn started() -> Self {
-        Self {
-            status: PostLoginBootstrapStatus::Started,
-            reason: None,
-        }
-    }
-
-    fn skipped(reason: PostLoginBootstrapReason) -> Self {
-        Self {
-            status: PostLoginBootstrapStatus::Skipped,
-            reason: Some(reason),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PostLoginBootstrapResult {
-    broker_sync: PostLoginBootstrapSyncResult,
-    device_sync: PostLoginBootstrapSyncResult,
-}
-
-#[cfg(feature = "connect-sync")]
-enum PostLoginBrokerBootstrapDecision<Guard> {
-    Start(Guard),
-    Skip(PostLoginBootstrapReason),
-}
-
-#[cfg(feature = "connect-sync")]
-async fn prepare_post_login_broker_bootstrap<
-    CheckEntitlement,
-    CheckEntitlementFuture,
-    ListConnections,
-    ListConnectionsFuture,
-    TryStart,
-    Guard,
->(
-    check_entitlement: CheckEntitlement,
-    list_connections: ListConnections,
-    try_start: TryStart,
-) -> PostLoginBrokerBootstrapDecision<Guard>
-where
-    CheckEntitlement: FnOnce() -> CheckEntitlementFuture,
-    CheckEntitlementFuture: Future<Output = Result<bool, String>>,
-    ListConnections: FnOnce() -> ListConnectionsFuture,
-    ListConnectionsFuture: Future<Output = Result<Vec<BrokerConnection>, String>>,
-    TryStart: FnOnce() -> Option<Guard>,
-{
-    match check_entitlement().await {
-        Ok(true) => {}
-        Ok(false) => {
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::NotEntitled);
-        }
-        Err(err) => {
-            debug!(
-                "[Connect] Post-login broker sync skipped: could not verify entitlement ({})",
-                err
-            );
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::Error);
-        }
-    }
-
-    let connections = match list_connections().await {
-        Ok(connections) => connections,
-        Err(err) => {
-            debug!(
-                "[Connect] Post-login broker sync skipped: failed to inspect connections ({})",
-                err
-            );
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::Error);
-        }
-    };
-
-    if !connections.iter().any(is_active_broker_connection) {
-        return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::NoConnections);
-    }
-
-    match try_start() {
-        Some(guard) => PostLoginBrokerBootstrapDecision::Start(guard),
-        None => PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::AlreadyRunning),
-    }
-}
 
 #[cfg(feature = "device-sync")]
 enum PostLoginDeviceBootstrapDecision {
@@ -234,6 +127,7 @@ async fn run_post_login_broker_bootstrap(
     let guard_context = Arc::clone(&context);
 
     let decision = prepare_post_login_broker_bootstrap(
+        true,
         move || async move {
             entitlement_context
                 .connect_service()
@@ -406,6 +300,9 @@ mod tests {
     };
 
     #[cfg(feature = "connect-sync")]
+    use wealthfolio_connect::BrokerConnection;
+
+    #[cfg(feature = "connect-sync")]
     fn broker_connection(status: Option<&str>, disabled: bool) -> BrokerConnection {
         BrokerConnection {
             id: "connection-1".to_string(),
@@ -425,6 +322,7 @@ mod tests {
         let list_calls = Arc::new(AtomicUsize::new(0));
 
         let decision = prepare_post_login_broker_bootstrap(
+            true,
             || async { Ok(false) },
             {
                 let list_calls = Arc::clone(&list_calls);
@@ -449,15 +347,19 @@ mod tests {
     async fn broker_preflight_zero_connections_skips_without_starting() {
         let start_calls = Arc::new(AtomicUsize::new(0));
 
-        let decision =
-            prepare_post_login_broker_bootstrap(|| async { Ok(true) }, || async { Ok(vec![]) }, {
+        let decision = prepare_post_login_broker_bootstrap(
+            true,
+            || async { Ok(true) },
+            || async { Ok(vec![]) },
+            {
                 let start_calls = Arc::clone(&start_calls);
                 move || {
                     start_calls.fetch_add(1, Ordering::SeqCst);
                     Some(())
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert!(matches!(
             decision,
@@ -470,6 +372,7 @@ mod tests {
     #[tokio::test]
     async fn broker_preflight_requires_active_usable_connection() {
         let decision = prepare_post_login_broker_bootstrap(
+            true,
             || async { Ok(true) },
             || async {
                 Ok(vec![
@@ -492,6 +395,7 @@ mod tests {
     #[tokio::test]
     async fn broker_preflight_active_connection_starts() {
         let decision = prepare_post_login_broker_bootstrap(
+            true,
             || async { Ok(true) },
             || async { Ok(vec![broker_connection(Some("connected"), false)]) },
             || Some("guard"),
@@ -508,6 +412,7 @@ mod tests {
     #[tokio::test]
     async fn broker_preflight_already_running_skips() {
         let decision = prepare_post_login_broker_bootstrap(
+            true,
             || async { Ok(true) },
             || async { Ok(vec![broker_connection(Some("connected"), false)]) },
             || None::<()>,

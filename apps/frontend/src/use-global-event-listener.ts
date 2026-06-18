@@ -32,6 +32,8 @@ const TOAST_IDS = {
 const BROKER_SYNC_FAILURE_DESCRIPTION =
   "We couldn't sync your broker data. Please try again later.";
 
+const POST_LOGIN_REQUIRED_LISTENERS = new Set(["broker-sync-complete", "broker-sync-error"]);
+
 interface MarketSyncCompletePayload {
   failed_syncs?: [string, string][];
   skipped_reasons?: [string, string][];
@@ -284,11 +286,13 @@ const useGlobalEventListener = () => {
 
       const results = await Promise.allSettled(listenerSetups.map(([, setup]) => setup));
       const cleanupFns: (() => void)[] = [];
+      const readyListeners = new Set<string>();
 
       results.forEach((result, index) => {
         const name = listenerSetups[index]?.[0] ?? "unknown";
         if (result.status === "fulfilled") {
           cleanupFns.push(result.value);
+          readyListeners.add(name);
         } else {
           logger.error(`Failed to setup ${name} listener: ${String(result.reason)}`);
         }
@@ -307,7 +311,9 @@ const useGlobalEventListener = () => {
       }
 
       cleanupFn = cleanup;
-      setAreListenersReady(cleanupFns.length > 0);
+      setAreListenersReady(
+        Array.from(POST_LOGIN_REQUIRED_LISTENERS).every((name) => readyListeners.has(name)),
+      );
 
       // Trigger initial portfolio update after listeners are set up
       if (!hasTriggeredInitialUpdate.current) {

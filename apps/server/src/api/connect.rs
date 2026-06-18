@@ -4,10 +4,7 @@
 //! from the Wealthfolio Connect cloud service.
 
 use std::future::Future;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
@@ -25,13 +22,17 @@ use crate::events::{
 };
 use crate::main_lib::AppState;
 use axum::http::StatusCode;
+use wealthfolio_connect::prepare_post_login_broker_bootstrap;
 use wealthfolio_connect::{
+    acquire_broker_sync_guard,
     broker::{
         BrokerApiClient, PlansResponse, SyncAccountsResponse, SyncActivitiesResponse,
         SyncConnectionsResponse, UserInfo,
     },
-    ensure_valid_access_token, fetch_subscription_plans_public, ConnectApiClient, SyncConfig,
-    SyncOrchestrator, SyncProgressPayload, SyncProgressReporter, SyncResult, TokenLifecycleConfig,
+    ensure_valid_access_token, fetch_subscription_plans_public, BrokerSyncRunGuard,
+    ConnectApiClient, PostLoginBootstrapReason, PostLoginBootstrapResult,
+    PostLoginBootstrapSyncResult, PostLoginBrokerBootstrapDecision, SyncConfig, SyncOrchestrator,
+    SyncProgressPayload, SyncProgressReporter, SyncResult, TokenLifecycleConfig,
     TokenLifecycleError, CLOUD_ACCESS_TOKEN_KEY, CLOUD_REFRESH_TOKEN_KEY,
 };
 #[cfg(feature = "device-sync")]
@@ -39,122 +40,6 @@ use wealthfolio_device_sync::{EnableSyncResult, SyncState, SyncStateResult};
 
 #[cfg(feature = "device-sync")]
 const DEVICE_ID_KEY: &str = "sync_device_id";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PostLoginBootstrapStatus {
-    Started,
-    Skipped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
-enum PostLoginBootstrapReason {
-    FeatureDisabled,
-    NotEntitled,
-    NoConnections,
-    AlreadyRunning,
-    NotEnrolled,
-    NotReady,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PostLoginBootstrapSyncResult {
-    status: PostLoginBootstrapStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<PostLoginBootstrapReason>,
-}
-
-impl PostLoginBootstrapSyncResult {
-    fn started() -> Self {
-        Self {
-            status: PostLoginBootstrapStatus::Started,
-            reason: None,
-        }
-    }
-
-    fn skipped(reason: PostLoginBootstrapReason) -> Self {
-        Self {
-            status: PostLoginBootstrapStatus::Skipped,
-            reason: Some(reason),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PostLoginBootstrapResult {
-    broker_sync: PostLoginBootstrapSyncResult,
-    device_sync: PostLoginBootstrapSyncResult,
-}
-
-enum PostLoginBrokerBootstrapDecision<Guard> {
-    Start(Guard),
-    Skip(PostLoginBootstrapReason),
-}
-
-async fn prepare_post_login_broker_bootstrap<
-    CheckEntitlement,
-    CheckEntitlementFuture,
-    ListConnections,
-    ListConnectionsFuture,
-    TryStart,
-    Guard,
->(
-    feature_enabled: bool,
-    check_entitlement: CheckEntitlement,
-    list_connections: ListConnections,
-    try_start: TryStart,
-) -> PostLoginBrokerBootstrapDecision<Guard>
-where
-    CheckEntitlement: FnOnce() -> CheckEntitlementFuture,
-    CheckEntitlementFuture: Future<Output = Result<bool, String>>,
-    ListConnections: FnOnce() -> ListConnectionsFuture,
-    ListConnectionsFuture:
-        Future<Output = Result<Vec<wealthfolio_connect::broker::BrokerConnection>, String>>,
-    TryStart: FnOnce() -> Option<Guard>,
-{
-    if !feature_enabled {
-        return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::FeatureDisabled);
-    }
-
-    match check_entitlement().await {
-        Ok(true) => {}
-        Ok(false) => {
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::NotEntitled);
-        }
-        Err(err) => {
-            debug!(
-                "[Connect] Post-login broker sync skipped: could not verify entitlement ({})",
-                err
-            );
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::Error);
-        }
-    }
-
-    let connections = match list_connections().await {
-        Ok(connections) => connections,
-        Err(err) => {
-            debug!(
-                "[Connect] Post-login broker sync skipped: failed to inspect connections ({})",
-                err
-            );
-            return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::Error);
-        }
-    };
-
-    if !connections.iter().any(is_active_broker_connection) {
-        return PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::NoConnections);
-    }
-
-    match try_start() {
-        Some(guard) => PostLoginBrokerBootstrapDecision::Start(guard),
-        None => PostLoginBrokerBootstrapDecision::Skip(PostLoginBootstrapReason::AlreadyRunning),
-    }
-}
 
 #[cfg(feature = "device-sync")]
 enum PostLoginDeviceBootstrapDecision {
@@ -202,32 +87,8 @@ where
     PostLoginDeviceBootstrapDecision::StartBackground
 }
 
-struct BrokerSyncRunGuard {
-    running: Arc<AtomicBool>,
-}
-
-impl Drop for BrokerSyncRunGuard {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-    }
-}
-
 fn try_acquire_broker_sync_guard(state: &AppState) -> Option<BrokerSyncRunGuard> {
-    state
-        .broker_sync_running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .ok()
-        .map(|_| BrokerSyncRunGuard {
-            running: Arc::clone(&state.broker_sync_running),
-        })
-}
-
-fn is_active_broker_connection(connection: &wealthfolio_connect::broker::BrokerConnection) -> bool {
-    !connection.disabled
-        && connection
-            .status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
+    acquire_broker_sync_guard(&state.broker_sync_running)
 }
 
 fn ensure_cloud_sync_enabled() -> ApiResult<()> {
@@ -851,9 +712,17 @@ async fn perform_broker_sync_with_guard(
 ) -> Result<SyncResult, String> {
     ensure_connect_sync_enabled().map_err(|e| e.to_string())?;
     // Create API client
-    let client = create_connect_client(state)
-        .await
-        .map_err(|e| e.to_string())?;
+    let client = match create_connect_client(state).await {
+        Ok(client) => client,
+        Err(err) => {
+            let message = err.to_string();
+            state.event_bus.publish(ServerEvent::with_payload(
+                BROKER_SYNC_ERROR,
+                serde_json::json!({ "error": message }),
+            ));
+            return Err(message);
+        }
+    };
 
     // Create progress reporter and orchestrator
     let reporter = Arc::new(EventBusProgressReporter::new(state.event_bus.clone()));
